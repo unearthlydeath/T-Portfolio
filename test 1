@@ -1,0 +1,170 @@
+//+------------------------------------------------------------------+
+//|                                                      ProjectName |
+//|                                      Copyright 2020, CompanyName |
+//|                                       http://www.companyname.net |
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// ===== USER SETTINGS =====
+input double RiskPercent = 2.5;        // For $12 account (balanced)
+input int FastEMA = 50;
+input int SlowEMA = 200;
+input int RSI_Period = 14;
+input int ATR_Period = 14;             // Added input for ATR period
+input double ATR_Multiplier = 2.2;
+input double TP_Multiplier = 1.4;
+input int CooldownSeconds = 30;
+input int MagicNumber = 99001;
+
+// Loss Recovery
+input double LossLotMultiplier = 0.5;   // Reduce lot after loss
+
+datetime lastTradeTime = 0;
+double recoveryFactor = 1.0;
+
+// Indicator handles and values
+int fastEMA_handle, slowEMA_handle, rsi_handle, atr_handle;
+double fastEMA, slowEMA, rsi, atr;
+
+// ===== AUTO LOT SIZE =====
+double AutoLot(double sl_points)
+  {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk = balance * (RiskPercent / 100.0) * recoveryFactor;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double lotStep  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   double lot = risk / (sl_points * tickValue);
+   lot = MathFloor(lot / lotStep) * lotStep;
+
+   if(lot < minLot)
+      lot = minLot;
+   if(lot > maxLot)
+      lot = maxLot;
+
+   return lot;
+  }
+
+// ===== CHECK OPEN TRADE FOR THIS SYMBOL =====
+bool HasOpenTrade()
+  {
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      if(PositionGetSymbol(i) == _Symbol)
+        {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            return true;
+        }
+     }
+   return false;
+  }
+
+// ===== CHECK LAST TRADE RESULT =====
+void UpdateRecovery()
+  {
+   HistorySelect(TimeCurrent()-86400, TimeCurrent());
+   int deals = HistoryDealsTotal();
+   if(deals == 0)
+     {
+      recoveryFactor = 1.0;   // Reset if no history
+      return;
+     }
+
+   for(int i = deals-1; i >= 0; i--)  // Loop backwards for most recent
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol &&
+         HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber)
+        {
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         recoveryFactor = (profit < 0) ? LossLotMultiplier : 1.0;
+         return;  // Found the last relevant deal
+        }
+     }
+   recoveryFactor = 1.0;  // No relevant deals found
+  }
+
+// ===== INITIALIZE INDICATORS =====
+void InitializeIndicators()
+  {
+   fastEMA_handle = iMA(_Symbol, PERIOD_CURRENT, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   slowEMA_handle = iMA(_Symbol, PERIOD_CURRENT, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   rsi_handle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+   atr_handle = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
+  }
+
+// ===== MAIN LOOP =====
+void OnTick()
+  {
+// Initialize indicators on first run
+   static bool initialized = false;
+   if(!initialized)
+     {
+      InitializeIndicators();
+      initialized = true;
+     }
+
+   UpdateRecovery();
+
+   if(TimeCurrent() - lastTradeTime < CooldownSeconds)
+      return;
+   if(HasOpenTrade())
+      return;
+
+// Get indicator values using CopyBuffer
+   double fastEMA_buffer[1], slowEMA_buffer[1], rsi_buffer[1], atr_buffer[1];
+   if(CopyBuffer(fastEMA_handle, 0, 0, 1, fastEMA_buffer) != 1 ||
+      CopyBuffer(slowEMA_handle, 0, 0, 1, slowEMA_buffer) != 1 ||
+      CopyBuffer(rsi_handle, 0, 0, 1, rsi_buffer) != 1 ||
+      CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) != 1)
+     {
+      return;  // Skip if unable to copy buffer
+     }
+   fastEMA = fastEMA_buffer[0];
+   slowEMA = slowEMA_buffer[0];
+   rsi = rsi_buffer[0];
+   atr = atr_buffer[0];
+
+   if(fastEMA == EMPTY_VALUE || slowEMA == EMPTY_VALUE || rsi == EMPTY_VALUE || atr == EMPTY_VALUE)
+      return;  // Skip tick if invalid indicators
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl_points = atr * ATR_Multiplier / _Point;
+   double tp_points = sl_points * TP_Multiplier;
+   double lot = AutoLot(sl_points);
+
+   bool uptrend = fastEMA > slowEMA;
+   bool downtrend = fastEMA < slowEMA;
+
+   trade.SetExpertMagicNumber(MagicNumber);
+
+// BUY
+   if(uptrend && rsi < 30)
+     {
+      double sl_buy = ask - sl_points * _Point;
+      double tp_buy = ask + tp_points * _Point;
+      if(trade.Buy(lot, _Symbol, ask, sl_buy, tp_buy) &&
+         trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+         lastTradeTime = TimeCurrent();
+        }
+     }
+
+// SELL
+   if(downtrend && rsi > 70)
+     {
+      double sl_sell = bid + sl_points * _Point;
+      double tp_sell = bid - tp_points * _Point;
+      if(trade.Sell(lot, _Symbol, bid, sl_sell, tp_sell) &&
+         trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+         lastTradeTime = TimeCurrent();
+        }
+     }
+  }
+//+------------------------------------------------------------------+
